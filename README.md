@@ -493,7 +493,40 @@ npm run matrix    # acceptance matrix (honest about skips)
 | Node | ≥ 26 |
 | System binaries | `ffmpeg`, `ffprobe`, `yt-dlp`, `tesseract` (with `chi_sim` for Chinese OCR) |
 | Models | ~1.5 GB, fetched by `scripts/fetch-models.sh` — Silero VAD, Whisper small, SenseVoice |
-| Platform | Developed on macOS/arm64; nothing is platform-specific by design, but other platforms are untested |
+| Platform | Developed on macOS/arm64; macOS 12 on Intel is verified (see below); nothing is platform-specific by design, but other platforms are untested |
+
+### macOS 12 on Intel
+
+`onnxruntime-node`'s prebuilt `darwin-x64` binaries are linked against a newer libc++ than macOS 12 ships: they reference the C++17 floating-point `std::to_chars` overloads, which only exist from macOS 13. Loading them fails outright —
+
+```
+Symbol not found: __ZNSt3__18to_charsEPcS0_d
+  Expected in: /usr/lib/libc++.1.dylib
+```
+
+— and that takes the entire native ONNX backend down with it. Switching to the WASM backend does **not** work around it: `@huggingface/transformers` imports `onnxruntime-node` statically, so the module fails to load before any backend can be selected.
+
+`./ort-macos12-shim.sh` fixes it: it compiles `native/ort-toshim/to_chars_shim.cpp` into a tiny `cxx.dylib` placed next to the ORT dylib — providing the nine missing symbols while re-exporting the real libc++ for everything else — then redirects the ORT dylib's libc++ dependency at it with `install_name_tool`. The ORT dylib is unsigned, so no `sudo` and no re-signing are involved.
+
+```bash
+./ort-macos12-shim.sh           # apply (idempotent, then loads the binding to prove it)
+./ort-macos12-shim.sh --check   # report the state, change nothing
+./ort-macos12-shim.sh --restore # back to the original binaries
+```
+
+Re-run it after every `npm install`, which replaces the patched binaries. It needs the Xcode command line tools (`xcode-select --install`). On any machine whose dylib has no missing `to_chars` symbols, the script reports the patch as unnecessary and changes nothing.
+
+Node itself hits the same wall one version earlier: Node 26's binary references `std::__libcpp_verbose_abort`, which macOS 12's libc++ does not export, so it aborts before a single line of JavaScript runs —
+
+```
+dyld: Symbol not found: (__ZNSt3__122__libcpp_verbose_abortEPKcz)
+  Referenced from: .../nvm/versions/node/v26.8.2/bin/node
+  Expected in: /usr/lib/libc++.1.dylib
+```
+
+Node 22 runs the pipeline end to end (`nvm use 22`), and because `engines` still asks for `>=26`, installing on this platform needs `npm install --engine-strict=false` — followed by `./ort-macos12-shim.sh`, since a fresh install restores the unpatched dylib.
+
+OCR is the one feature that stays unavailable: Homebrew has no tesseract bottle for Monterey (`brew install --force-bottle tesseract` answers `` `--force-bottle` passed but tesseract has no bottle! ``) and a source build is a long compile of its whole dependency tree. Nothing else changes — frames still come back with their embeddings, scenes and transcript windows, and `processing.warnings` carries `ocr unavailable: ... spawn tesseract ENOENT`; only text burned into the pixels (and the WeChat Channels OCR path) is lost.
 
 Speech recognition routes by language: `zh`, `yue`, `ja`, `ko` → SenseVoice; everything else → Whisper. There is no audio-based language detection, because the installed library returns a constant value regardless of what is actually spoken — supply `language` when you know it.
 
